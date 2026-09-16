@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Quét QR vị trí</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;width:100%;height:100%;background:#000;color:#fff;font-family:Arial,sans-serif}
+  body{display:flex;flex-direction:column}
+  .head{display:flex;align-items:center;gap:10px;padding:12px 14px;background:#111;flex-shrink:0}
+  .head button{width:42px;height:42px;border:0;border-radius:21px;background:#2a2a2a;color:#fff;font-size:20px}
+  .head .title{font-weight:800}
+  .wrap{position:relative;flex:1;min-height:0;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000}
+  video{display:block;width:100%;height:100%;object-fit:cover;background:#000}
+  canvas{display:none}
+  .frame{
+    position:absolute;left:50%;top:50%;width:min(76vw,340px);height:min(46vw,220px);
+    transform:translate(-50%,-50%);border:3px solid rgba(255,255,255,.95);
+    border-radius:16px;box-shadow:0 0 0 9999px rgba(0,0,0,.28),0 0 24px rgba(255,255,255,.22);
+    pointer-events:none
+  }
+  .status{padding:10px 14px;background:#111;font-size:14px;line-height:1.45;min-height:46px}
+  .actions{display:flex;gap:8px;padding:10px 12px calc(10px + env(safe-area-inset-bottom));background:#111}
+  .actions button{flex:1;min-height:48px;border:0;border-radius:10px;font-size:15px;font-weight:700}
+  #retry{display:none}
+</style>
+</head>
+<body>
+  <div class="head">
+    <button type="button" onclick="closeScanner()">←</button>
+    <div class="title">📷 Quét QR vị trí</div>
+  </div>
+
+  <div class="wrap" id="cameraWrap">
+    <video id="video" playsinline autoplay muted></video>
+    <canvas id="canvas"></canvas>
+    <div class="frame"></div>
+  </div>
+
+  <div class="status" id="status">Đang chuẩn bị camera…</div>
+
+  <div class="actions">
+    <button type="button" id="retry" onclick="startCamera()">🔄 Thử lại</button>
+    <button type="button" onclick="closeScanner()">Đóng</button>
+  </div>
+
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+<script>
+'use strict';
+
+const CONFIG = {
+  // Chỉ dùng khi bạn muốn khóa domain trang Apps Script.
+  // Có thể để [] trong giai đoạn test.
+  allowedParentOrigins: []
+};
+
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+const statusEl = document.getElementById('status');
+const retryBtn = document.getElementById('retry');
+
+let stream = null;
+let timer = null;
+let scanning = false;
+let sent = false;
+
+function setStatus(msg) {
+  statusEl.textContent = msg;
+}
+
+function parentAllowed() {
+  if (!window.opener) return false;
+  if (!CONFIG.allowedParentOrigins.length) return true;
+  try {
+    return CONFIG.allowedParentOrigins.includes(document.referrer ? new URL(document.referrer).origin : '');
+  } catch(e) {
+    return true;
+  }
+}
+
+function closeScanner() {
+  stopCamera();
+  try { window.close(); } catch(e) {}
+  setTimeout(() => {
+    setStatus('Có thể đóng tab này để quay lại màn hình kho.');
+  }, 50);
+}
+
+function stopCamera() {
+  scanning = false;
+  if (timer) {
+    clearTimeout(timer);
+    timer = null;
+  }
+  if (stream) {
+    stream.getTracks().forEach(t => t.stop());
+    stream = null;
+  }
+  video.srcObject = null;
+}
+
+async function chooseCamera() {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const cams = devices.filter(d => d.kind === 'videoinput');
+  if (!cams.length) throw new Error('Không tìm thấy camera.');
+
+  // Ưu tiên camera có tên sau/back/environment.
+  const preferred = cams.find(d => /back|rear|environment|sau|sườn/i.test(d.label));
+  return preferred ? preferred.deviceId : cams[0].deviceId;
+}
+
+async function startCamera() {
+  stopCamera();
+  sent = false;
+  retryBtn.style.display = 'none';
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setStatus('❌ Trình duyệt không hỗ trợ camera. Hãy mở bằng Chrome/Safari trên HTTPS.');
+    retryBtn.style.display = 'block';
+    return;
+  }
+
+  setStatus('Đang mở camera…');
+
+  try {
+    // Lần đầu: để browser tự chọn camera sau.
+    let constraints = {
+      audio: false,
+      video: {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      }
+    };
+
+    try {
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (e1) {
+      const cameraId = await chooseCamera();
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { deviceId: { exact: cameraId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+      });
+    }
+
+    video.srcObject = stream;
+    await video.play();
+
+    setStatus('✅ Camera đã mở. Đưa QR vị trí vào khung.');
+    scanning = true;
+    scanLoop();
+
+  } catch (err) {
+    console.error(err);
+    const name = err && err.name ? err.name : '';
+    let msg = '❌ Không mở được camera.';
+    if (name === 'NotAllowedError' || name === 'SecurityError') {
+      msg = '❌ Trình duyệt chưa cho phép camera. Hãy kiểm tra quyền Camera và mở trang bằng HTTPS.';
+    } else if (name === 'NotFoundError') {
+      msg = '❌ Không tìm thấy camera trên thiết bị.';
+    } else if (name === 'NotReadableError') {
+      msg = '❌ Camera đang bị ứng dụng khác sử dụng.';
+    } else if (err && err.message) {
+      msg += ' ' + err.message;
+    }
+    setStatus(msg);
+    retryBtn.style.display = 'block';
+  }
+}
+
+function scanLoop() {
+  if (!scanning || sent) return;
+  if (video.readyState < 2 || video.videoWidth <= 0 || video.videoHeight <= 0) {
+    timer = setTimeout(scanLoop, 150);
+    return;
+  }
+
+  const maxW = 900;
+  const scale = Math.min(1, maxW / video.videoWidth);
+  const w = Math.max(320, Math.round(video.videoWidth * scale));
+  const h = Math.round(video.videoHeight * (w / video.videoWidth));
+
+  canvas.width = w;
+  canvas.height = h;
+
+  ctx.drawImage(video, 0, 0, w, h);
+  const image = ctx.getImageData(0, 0, w, h);
+  const code = window.jsQR ? jsQR(image.data, w, h, { inversionAttempts: 'attemptBoth' }) : null;
+
+  if (code && code.data) {
+    handleQR(code.data);
+    return;
+  }
+
+  timer = setTimeout(scanLoop, 120);
+}
+
+function handleQR(raw) {
+  if (sent) return;
+  const text = String(raw || '').trim();
+  if (!text) return;
+
+  sent = true;
+  scanning = false;
+  setStatus('✅ Đã quét: ' + text);
+
+  try {
+    if (!window.opener || window.opener.closed) {
+      setStatus('✅ Đã quét nhưng không còn cửa sổ Apps Script để nhận kết quả.');
+      return;
+    }
+
+    const targetOrigin = document.referrer ? new URL(document.referrer).origin : '*';
+    window.opener.postMessage({
+      type: 'QR_LOCATION_SCANNED',
+      raw: text
+    }, targetOrigin);
+
+    setTimeout(() => {
+      try { window.close(); } catch(e) {}
+    }, 250);
+  } catch (e) {
+    console.error(e);
+    setStatus('❌ Không gửi được kết quả về trang kho.');
+    sent = false;
+    scanning = true;
+    scanLoop();
+  }
+}
+
+window.addEventListener('beforeunload', stopCamera);
+startCamera();
+</script>
+</body>
+</html>
