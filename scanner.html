@@ -49,10 +49,34 @@
 <script>
 'use strict';
 
+// ============================================================
+// Scanner.html — quét QR (tem Vị trí "VT:..." / Mã hàng "MH:...") rồi gửi chuỗi
+// thô về cửa sổ mở nó (window.opener) qua postMessage {type:'QR_LOCATION_SCANNED', raw}.
+//
+// v2 — [TĂNG TỐC ĐỘ QUÉT] (giao thức gửi kết quả GIỮ NGUYÊN — trang kho không phải sửa)
+//   • Dùng BarcodeDetector có sẵn của trình duyệt (Chrome Android) khi hỗ trợ QR —
+//     nhanh và chịu ánh sáng/góc nghiêng tốt hơn jsQR nhiều. Không hỗ trợ (iPhone…)
+//     -> tự quay về jsQR như cũ.
+//   • jsQR: phân tích VÙNG GIỮA khung hình ở độ phân giải gốc (trước đây thu cả khung
+//     xuống 900px -> tem ở xa chỉ còn vài pixel mỗi ô). Cứ vài lượt thử thêm cả khung
+//     (thu nhỏ) để vẫn bắt được tem lệch khỏi khung trắng.
+//   • jsQR: 'dontInvert' — tem in đen trên nền trắng, không cần thử đảo màu (gấp đôi
+//     số lần quét mỗi giây so với 'attemptBoth').
+//   • Xin 1080p + tự lấy nét liên tục trên máy hỗ trợ (máy không hỗ trợ tự bỏ qua).
+// ============================================================
+
 const CONFIG = {
   // Chỉ dùng khi bạn muốn khóa domain trang Apps Script.
   // Có thể để [] trong giai đoạn test.
-  allowedParentOrigins: []
+  allowedParentOrigins: [],
+  // Tỉ lệ cạnh vùng giữa (theo cạnh ngắn của khung hình) dùng để quét bằng jsQR —
+  // phủ trọn khung trắng trên màn hình.
+  tiLeVungGiua: 0.9,
+  // Cạnh tối đa (px) của ảnh đưa vào jsQR — đủ chi tiết, vẫn nhanh trên máy yếu.
+  canhToiDaJsQR: 720,
+  // Cứ N lượt quét vùng giữa thì có 1 lượt quét cả khung hình (bắt tem lệch khung).
+  moiNLuotQuetCaKhung: 4,
+  nhipQuetMs: 100
 };
 
 const video = document.getElementById('video');
@@ -65,6 +89,8 @@ let stream = null;
 let timer = null;
 let scanning = false;
 let sent = false;
+let detector = null;   // BarcodeDetector nếu trình duyệt hỗ trợ QR
+let luot = 0;
 
 function setStatus(msg) {
   statusEl.textContent = msg;
@@ -111,9 +137,37 @@ async function chooseCamera() {
   return preferred ? preferred.deviceId : cams[0].deviceId;
 }
 
+// BarcodeDetector chỉ dùng khi trình duyệt khai báo có hỗ trợ định dạng QR.
+async function taoDetector() {
+  try {
+    if (!('BarcodeDetector' in window)) return null;
+    const formats = await window.BarcodeDetector.getSupportedFormats();
+    if (!formats || formats.indexOf('qr_code') === -1) return null;
+    return new window.BarcodeDetector({ formats: ['qr_code'] });
+  } catch (e) {
+    console.warn('BarcodeDetector không dùng được, chuyển sang jsQR:', e);
+    return null;
+  }
+}
+
+// Bật tự lấy nét liên tục nếu camera hỗ trợ — không hỗ trợ thì bỏ qua, không báo lỗi.
+async function batLayNetLienTuc() {
+  try {
+    const track = stream && stream.getVideoTracks()[0];
+    if (!track || !track.getCapabilities) return;
+    const cap = track.getCapabilities();
+    if (cap.focusMode && cap.focusMode.indexOf('continuous') !== -1) {
+      await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+    }
+  } catch (e) {
+    console.warn('Không bật được lấy nét liên tục:', e);
+  }
+}
+
 async function startCamera() {
   stopCamera();
   sent = false;
+  luot = 0;
   retryBtn.style.display = 'none';
 
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -126,12 +180,12 @@ async function startCamera() {
 
   try {
     // Lần đầu: để browser tự chọn camera sau.
-    let constraints = {
+    const constraints = {
       audio: false,
       video: {
         facingMode: { ideal: 'environment' },
-        width: { ideal: 1280 },
-        height: { ideal: 720 }
+        width: { ideal: 1920 },
+        height: { ideal: 1080 }
       }
     };
 
@@ -141,12 +195,14 @@ async function startCamera() {
       const cameraId = await chooseCamera();
       stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
-        video: { deviceId: { exact: cameraId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+        video: { deviceId: { exact: cameraId }, width: { ideal: 1920 }, height: { ideal: 1080 } }
       });
     }
 
     video.srcObject = stream;
     await video.play();
+    await batLayNetLienTuc();
+    if (!detector) detector = await taoDetector();
 
     setStatus('✅ Camera đã mở. Đưa QR vị trí vào khung.');
     scanning = true;
@@ -170,31 +226,57 @@ async function startCamera() {
   }
 }
 
-function scanLoop() {
+// jsQR trên 1 vùng (sx, sy, sw, sh) của khung hình video, thu nhỏ nếu vượt canhToiDaJsQR.
+function quetJsQRVung(sx, sy, sw, sh) {
+  if (!window.jsQR) return null;
+  const scale = Math.min(1, CONFIG.canhToiDaJsQR / Math.max(sw, sh));
+  const w = Math.max(1, Math.round(sw * scale));
+  const h = Math.max(1, Math.round(sh * scale));
+  canvas.width = w;
+  canvas.height = h;
+  ctx.drawImage(video, sx, sy, sw, sh, 0, 0, w, h);
+  const image = ctx.getImageData(0, 0, w, h);
+  const code = jsQR(image.data, w, h, { inversionAttempts: 'dontInvert' });
+  return code && code.data ? code.data : null;
+}
+
+function quetJsQR() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  luot++;
+  if (luot % CONFIG.moiNLuotQuetCaKhung === 0) {
+    return quetJsQRVung(0, 0, vw, vh);                 // thỉnh thoảng quét cả khung
+  }
+  const canh = Math.round(Math.min(vw, vh) * CONFIG.tiLeVungGiua);
+  return quetJsQRVung(Math.round((vw - canh) / 2), Math.round((vh - canh) / 2), canh, canh);
+}
+
+async function scanLoop() {
   if (!scanning || sent) return;
   if (video.readyState < 2 || video.videoWidth <= 0 || video.videoHeight <= 0) {
     timer = setTimeout(scanLoop, 150);
     return;
   }
 
-  const maxW = 900;
-  const scale = Math.min(1, maxW / video.videoWidth);
-  const w = Math.max(320, Math.round(video.videoWidth * scale));
-  const h = Math.round(video.videoHeight * (w / video.videoWidth));
-
-  canvas.width = w;
-  canvas.height = h;
-
-  ctx.drawImage(video, 0, 0, w, h);
-  const image = ctx.getImageData(0, 0, w, h);
-  const code = window.jsQR ? jsQR(image.data, w, h, { inversionAttempts: 'attemptBoth' }) : null;
-
-  if (code && code.data) {
-    handleQR(code.data);
-    return;
+  let data = null;
+  try {
+    if (detector) {
+      const ds = await detector.detect(video);
+      if (ds && ds.length && ds[0].rawValue) data = ds[0].rawValue;
+    } else {
+      data = quetJsQR();
+    }
+  } catch (e) {
+    // BarcodeDetector lỗi giữa chừng (vài máy) -> chuyển hẳn sang jsQR, không dừng quét.
+    console.warn('Lỗi khi quét, chuyển sang jsQR:', e);
+    detector = null;
   }
 
-  timer = setTimeout(scanLoop, 120);
+  if (!scanning || sent) return; // người dùng đã đóng trong lúc chờ detect()
+  if (data) {
+    handleQR(data);
+    return;
+  }
+  timer = setTimeout(scanLoop, CONFIG.nhipQuetMs);
 }
 
 function handleQR(raw) {
@@ -205,6 +287,7 @@ function handleQR(raw) {
   sent = true;
   scanning = false;
   setStatus('✅ Đã quét: ' + text);
+  try { if (navigator.vibrate) navigator.vibrate(80); } catch (e) {}
 
   try {
     if (!window.opener || window.opener.closed) {
