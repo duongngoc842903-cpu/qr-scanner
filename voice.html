@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ghi âm lệnh — NXT</title>
+<!--
+  voice.html — [07/11/2026] Cửa sổ ghi âm cho ô "🎤 Lệnh" của app NXT (Shared_Nav.html, GN_URL).
+  Vì sao ở đây: trang Apps Script chạy trong iframe sandbox nên bị chặn micro (giống camera QR) → mở cửa sổ riêng
+  trên GitHub Pages (cùng repo qr-scanner), nhận giọng nói tiếng Việt, gửi chữ về cửa sổ đã mở nó:
+  window.opener.postMessage({ type: 'NXT_VOICE', text }, '*') rồi tự đóng. Không lưu, không gửi đi đâu khác.
+  Cần Chrome / Edge (Web Speech API). Đặt file này cạnh scanner.html trong repo qr-scanner.
+-->
+<style>
+  :root{--bg:#0f172a;--card:#1e293b;--txt:#f1f5f9;--mut:#94a3b8;--acc:#7c3aed;--red:#ef4444}
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--txt);font:15px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:16px}
+  .c{width:100%;max-width:380px;background:var(--card);border-radius:18px;padding:22px 18px;text-align:center;box-shadow:0 12px 40px rgba(0,0,0,.4)}
+  h1{font-size:17px;margin:0 0 4px}
+  .m{color:var(--mut);font-size:13px;margin:0 0 18px}
+  #mic{width:110px;height:110px;border-radius:50%;border:0;background:var(--acc);color:#fff;font-size:46px;cursor:pointer;box-shadow:0 8px 24px rgba(124,58,237,.5)}
+  #mic.on{background:var(--red);animation:n 1s infinite}
+  @keyframes n{50%{transform:scale(1.06);opacity:.8}}
+  #txt{min-height:48px;margin:18px 0 6px;font-size:18px;font-weight:600;word-break:break-word}
+  #tt{color:var(--mut);font-size:13px;min-height:18px}
+  .vd{margin-top:14px;color:var(--mut);font-size:12px;line-height:1.6;text-align:left}
+  .vd b{color:var(--txt)}
+</style>
+</head>
+<body>
+<div class="c">
+  <h1>🎤 Nói lệnh</h1>
+  <p class="m">Bấm nút rồi nói. Xong tự gửi về app NXT.</p>
+  <button id="mic" type="button" aria-label="Ghi âm">🎙</button>
+  <div id="txt"></div>
+  <div id="tt">Bấm 🎙 để bắt đầu</div>
+  <div class="vd">Ví dụ:<br>• <b>tìm mã hàng 01 008520</b><br>• <b>tìm vị trí A1 gạch 29</b><br>• <b>mở nhập di động</b> · <b>vào kiểm kê</b></div>
+</div>
+<script>
+(function () {
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  var mic = document.getElementById('mic'), txt = document.getElementById('txt'), tt = document.getElementById('tt');
+  var r = null, dangNghe = false, daGui = false;
+  function gui(text) {
+    if (daGui) return; daGui = true;
+    if (!window.opener) { tt.textContent = 'Không tìm thấy cửa sổ app NXT — mở lại từ nút 🎤 Lệnh.'; daGui = false; return; }
+    try { window.opener.postMessage({ type: 'NXT_VOICE', text: text }, '*'); } catch (e) { tt.textContent = 'Không gửi được: ' + e.message; daGui = false; return; }
+    tt.textContent = '✅ Đã gửi — đang đóng…';
+    setTimeout(function () { window.close(); }, 600);
+  }
+  if (!SR) { tt.textContent = 'Trình duyệt này không hỗ trợ nhận giọng nói — dùng Chrome hoặc Edge.'; mic.disabled = true; return; }
+  function batDau() {
+    if (dangNghe) { try { r.stop(); } catch (e) {} return; }
+    r = new SR(); r.lang = 'vi-VN'; r.interimResults = true; r.maxAlternatives = 1;
+    r.onstart = function () { dangNghe = true; mic.classList.add('on'); tt.textContent = '🎙 Đang nghe…'; };
+    r.onresult = function (ev) {
+      var s = '', cuoi = false;
+      for (var i = 0; i < ev.results.length; i++) { s += ev.results[i][0].transcript; if (ev.results[i].isFinal) cuoi = true; }
+      txt.textContent = s;
+      if (cuoi && s.trim()) gui(s.trim());
+    };
+    r.onerror = function (ev) {
+      tt.textContent = ev.error === 'not-allowed' ? '⛔ Chưa cho phép micro — bấm biểu tượng ổ khoá trên thanh địa chỉ để cho phép, rồi thử lại.'
+        : ev.error === 'no-speech' ? 'Không nghe thấy gì — bấm 🎙 nói lại.' : 'Lỗi: ' + ev.error;
+    };
+    r.onend = function () { dangNghe = false; mic.classList.remove('on'); if (!daGui && !/Lỗi|⛔|Không nghe/.test(tt.textContent)) tt.textContent = 'Bấm 🎙 để nói lại'; };
+    try { r.start(); } catch (e) { tt.textContent = 'Không bật được micro: ' + e.message; }
+  }
+  mic.onclick = batDau;
+  batDau(); // mở cửa sổ là nghe luôn (trình duyệt có thể hỏi quyền micro lần đầu)
+})();
+</script>
+</body>
+</html>
