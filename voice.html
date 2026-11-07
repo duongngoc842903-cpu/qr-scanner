@@ -5,11 +5,12 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Ghi âm lệnh — NXT</title>
 <!--
-  voice.html — [07/11/2026] Cửa sổ ghi âm cho ô "🎤 Lệnh" của app NXT (Shared_Nav.html, GN_URL).
-  Vì sao ở đây: trang Apps Script chạy trong iframe sandbox nên bị chặn micro (giống camera QR) → mở cửa sổ riêng
-  trên GitHub Pages (cùng repo qr-scanner), nhận giọng nói tiếng Việt, gửi chữ về cửa sổ đã mở nó:
-  window.opener.postMessage({ type: 'NXT_VOICE', text }, '*') rồi tự đóng. Không lưu, không gửi đi đâu khác.
-  Cần Chrome / Edge (Web Speech API). Đặt file này cạnh scanner.html trong repo qr-scanner.
+  voice.html — cửa sổ THU ÂM cho ô "🎤 Lệnh" của app NXT (Shared_Nav.html, GN_URL). Đặt cạnh scanner.html trong repo qr-scanner.
+  [07/11/2026 22:3x] Bản 3: KHÔNG dùng bộ nhận giọng nói của trình duyệt nữa (báo "aborted", iPhone không ổn định).
+    Chỉ thu âm (MediaRecorder) → đổi sang WAV 16 kHz mono (nhỏ, Gemini đọc được) → gửi về cửa sổ app đã mở trang này:
+    window.opener.postMessage({ type: 'NXT_VOICE_AUDIO', mime: 'audio/wav', b64 }, '*') rồi tự đóng.
+    App gửi lên Apps Script → Gemini chép thành chữ (khoá API nằm ở server, không ở đây). Không lưu âm thanh ở đâu.
+  Bấm 🎙 = bắt đầu thu · bấm lần nữa = dừng & gửi · tự dừng sau TOI_DA_GIAY giây.
 -->
 <style>
   :root{--bg:#0f172a;--card:#1e293b;--txt:#f1f5f9;--mut:#94a3b8;--acc:#7c3aed;--red:#ef4444}
@@ -18,11 +19,12 @@
   .c{width:100%;max-width:380px;background:var(--card);border-radius:18px;padding:22px 18px;text-align:center;box-shadow:0 12px 40px rgba(0,0,0,.4)}
   h1{font-size:17px;margin:0 0 4px}
   .m{color:var(--mut);font-size:13px;margin:0 0 18px}
-  #mic{width:110px;height:110px;border-radius:50%;border:0;background:var(--acc);color:#fff;font-size:46px;cursor:pointer;box-shadow:0 8px 24px rgba(124,58,237,.5)}
+  #mic{width:120px;height:120px;border-radius:50%;border:0;background:var(--acc);color:#fff;font-size:50px;cursor:pointer;box-shadow:0 8px 24px rgba(124,58,237,.5);-webkit-tap-highlight-color:transparent}
   #mic.on{background:var(--red);animation:n 1s infinite}
-  @keyframes n{50%{transform:scale(1.06);opacity:.8}}
-  #txt{min-height:48px;margin:18px 0 6px;font-size:18px;font-weight:600;word-break:break-word}
-  #tt{color:var(--mut);font-size:13px;min-height:18px}
+  #mic:disabled{opacity:.5}
+  @keyframes n{50%{transform:scale(1.06);opacity:.85}}
+  #dem{font-size:22px;font-weight:700;margin:14px 0 4px;min-height:28px}
+  #tt{color:var(--mut);font-size:13px;min-height:36px}
   .vd{margin-top:14px;color:var(--mut);font-size:12px;line-height:1.6;text-align:left}
   .vd b{color:var(--txt)}
 </style>
@@ -30,54 +32,102 @@
 <body>
 <div class="c">
   <h1>🎤 Nói lệnh</h1>
-  <p class="m">Bấm nút rồi nói. Xong tự gửi về app NXT.</p>
-  <button id="mic" type="button" aria-label="Ghi âm">🎙</button>
-  <div id="txt"></div>
+  <p class="m">Bấm 🎙 để thu · bấm lần nữa để gửi</p>
+  <button id="mic" type="button" aria-label="Thu âm">🎙</button>
+  <div id="dem"></div>
   <div id="tt">Bấm 🎙 rồi nói</div>
   <div class="vd">Ví dụ:<br>• <b>tìm mã hàng 01 008520</b><br>• <b>tìm vị trí A1 gạch 29</b><br>• <b>mở nhập di động</b> · <b>vào kiểm kê</b></div>
 </div>
 <script>
 (function () {
-  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  var mic = document.getElementById('mic'), txt = document.getElementById('txt'), tt = document.getElementById('tt');
-  var r = null, dangNghe = false, daGui = false;
-  function gui(text) {
-    if (daGui) return; daGui = true;
-    if (!window.opener) { tt.textContent = 'Không tìm thấy cửa sổ app NXT — mở lại từ nút 🎤 Lệnh.'; daGui = false; return; }
-    try { window.opener.postMessage({ type: 'NXT_VOICE', text: text }, '*'); } catch (e) { tt.textContent = 'Không gửi được: ' + e.message; daGui = false; return; }
-    tt.textContent = '✅ Đã gửi — đang đóng…';
-    setTimeout(function () { window.close(); }, 600);
+  var TOI_DA_GIAY = 12, TAN_SO = 16000;
+  var mic = document.getElementById('mic'), dem = document.getElementById('dem'), tt = document.getElementById('tt');
+  var stream = null, rec = null, khuc = [], hen = null, demGiay = null, dangThu = false, dangXuLy = false;
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || typeof MediaRecorder === 'undefined') {
+    tt.textContent = 'Trình duyệt này không thu âm được — cập nhật iOS / dùng Safari hoặc Chrome bản mới.'; mic.disabled = true; return;
   }
-  if (!SR) { tt.textContent = 'Trình duyệt này không hỗ trợ nhận giọng nói — dùng Chrome hoặc Edge.'; mic.disabled = true; return; }
-  // [07/11/2026 22:1x] Sửa lỗi "aborted": trước đây tự bật nghe khi mở cửa sổ + người dùng bấm 🎙 lúc đang khởi động
-  //   → 2 lần start chồng nhau, Chrome huỷ lần đầu (aborted). Giờ CHỈ bật khi bấm, có cờ chống bấm chồng;
-  //   'aborted' không coi là lỗi. Chrome cần cửa sổ đang được chọn (focus) mới nghe.
-  var dangKhoi = false;
+  if (!window.opener) tt.textContent = '⚠ Mở trang này từ nút 🎤 Lệnh trong app NXT thì mới gửi được.';
+
+  function tatMic() { try { stream && stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {} stream = null; }
+  function datLai(thongBao) { dangThu = false; dangXuLy = false; mic.classList.remove('on'); mic.disabled = false; dem.textContent = ''; clearTimeout(hen); clearInterval(demGiay); if (thongBao) tt.textContent = thongBao; }
+
   function batDau() {
-    if (dangKhoi) return;
-    if (dangNghe) { try { r.stop(); } catch (e) {} return; }
-    dangKhoi = true;
-    r = new SR(); r.lang = 'vi-VN'; r.interimResults = true; r.maxAlternatives = 1; r.continuous = false;
-    r.onstart = function () { dangKhoi = false; dangNghe = true; mic.classList.add('on'); tt.textContent = '🎙 Đang nghe… nói đi'; };
-    r.onresult = function (ev) {
-      var s = '', cuoi = false;
-      for (var i = 0; i < ev.results.length; i++) { s += ev.results[i][0].transcript; if (ev.results[i].isFinal) cuoi = true; }
-      txt.textContent = s;
-      if (cuoi && s.trim()) gui(s.trim());
-    };
-    r.onerror = function (ev) {
-      dangKhoi = false;
-      if (ev.error === 'aborted') { tt.textContent = 'Bấm 🎙 để nói'; return; }
-      tt.textContent = ev.error === 'not-allowed' || ev.error === 'service-not-allowed' ? '⛔ Chưa cho phép micro — bấm biểu tượng ổ khoá trên thanh địa chỉ → Micro → Cho phép, rồi bấm 🎙.'
-        : ev.error === 'no-speech' ? 'Không nghe thấy gì — bấm 🎙 nói lại.'
-        : ev.error === 'network' ? '⛔ Lỗi mạng (nhận giọng nói cần Internet) — thử lại.'
-        : ev.error === 'audio-capture' ? '⛔ Không tìm thấy micro trên máy.' : 'Lỗi: ' + ev.error;
-    };
-    r.onend = function () { dangKhoi = false; dangNghe = false; mic.classList.remove('on'); if (!daGui && /Đang nghe/.test(tt.textContent)) tt.textContent = 'Bấm 🎙 để nói lại'; };
-    try { r.start(); } catch (e) { dangKhoi = false; tt.textContent = 'Không bật được micro: ' + e.message; }
+    if (dangXuLy) return;
+    if (dangThu) { dung(); return; }
+    dangXuLy = true; tt.textContent = 'Đang mở micro…';
+    navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } }).then(function (s) {
+      stream = s; khuc = [];
+      var loai = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm', 'audio/ogg'].filter(function (t) { return MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t); })[0];
+      rec = loai ? new MediaRecorder(s, { mimeType: loai }) : new MediaRecorder(s);
+      rec.ondataavailable = function (e) { if (e.data && e.data.size) khuc.push(e.data); };
+      rec.onstop = function () { tatMic(); xuLy(new Blob(khuc, { type: rec.mimeType || loai || 'audio/mp4' })); };
+      rec.start();
+      dangThu = true; dangXuLy = false; mic.classList.add('on'); tt.textContent = '🎙 Đang thu — nói xong bấm nút để gửi';
+      var batDauLuc = Date.now();
+      demGiay = setInterval(function () { dem.textContent = Math.round((Date.now() - batDauLuc) / 1000) + ' / ' + TOI_DA_GIAY + ' giây'; }, 250);
+      hen = setTimeout(dung, TOI_DA_GIAY * 1000);
+    }).catch(function (e) {
+      tatMic();
+      datLai(e && (e.name === 'NotAllowedError' || e.name === 'SecurityError')
+        ? '⛔ Chưa cho phép micro. iPhone: Cài đặt → Safari → Micro → Cho phép (hoặc bấm "aA" trên thanh địa chỉ → Cài đặt trang web → Micro), rồi bấm 🎙.'
+        : '⛔ Không mở được micro: ' + (e && (e.message || e.name)));
+    });
+  }
+  function dung() {
+    if (!dangThu || !rec) return;
+    dangThu = false; dangXuLy = true; mic.classList.remove('on'); mic.disabled = true; clearTimeout(hen); clearInterval(demGiay);
+    tt.textContent = '⏳ Đang xử lý âm thanh…';
+    try { rec.stop(); } catch (e) { tatMic(); datLai('Lỗi dừng thu: ' + e.message); }
+  }
+
+  // Đổi âm thanh thu được (webm / mp4) → WAV 16 kHz mono (Gemini đọc chắc chắn, dung lượng nhỏ)
+  function giaiMa(ctx, buf) {
+    return new Promise(function (ok, loi) {
+      var p = ctx.decodeAudioData(buf, ok, loi); // Safari cũ chỉ có dạng callback
+      if (p && p.then) p.then(ok, loi);
+    });
+  }
+  function thanhWav(audio) {
+    var src = audio.getChannelData(0), tiLe = audio.sampleRate / TAN_SO, n = Math.floor(src.length / tiLe), pcm = new Int16Array(n);
+    for (var i = 0; i < n; i++) {
+      var a = Math.floor(i * tiLe), b = Math.min(src.length, Math.floor((i + 1) * tiLe)), t = 0;
+      for (var j = a; j < b; j++) t += src[j];
+      var v = b > a ? t / (b - a) : src[a] || 0; v = Math.max(-1, Math.min(1, v));
+      pcm[i] = v < 0 ? v * 0x8000 : v * 0x7FFF;
+    }
+    var out = new DataView(new ArrayBuffer(44 + pcm.length * 2)), viet = function (o, s) { for (var k = 0; k < s.length; k++) out.setUint8(o + k, s.charCodeAt(k)); };
+    viet(0, 'RIFF'); out.setUint32(4, 36 + pcm.length * 2, true); viet(8, 'WAVE'); viet(12, 'fmt ');
+    out.setUint32(16, 16, true); out.setUint16(20, 1, true); out.setUint16(22, 1, true); out.setUint32(24, TAN_SO, true);
+    out.setUint32(28, TAN_SO * 2, true); out.setUint16(32, 2, true); out.setUint16(34, 16, true); viet(36, 'data'); out.setUint32(40, pcm.length * 2, true);
+    for (var m = 0; m < pcm.length; m++) out.setInt16(44 + m * 2, pcm[m], true);
+    return new Uint8Array(out.buffer);
+  }
+  function b64(u8) { var s = '', B = 0x8000; for (var i = 0; i < u8.length; i += B) s += String.fromCharCode.apply(null, u8.subarray(i, i + B)); return btoa(s); }
+  function mimeGoc(t) { t = String(t || '').split(';')[0]; return /mp4|m4a|aac/.test(t) ? 'audio/aac' : /ogg/.test(t) ? 'audio/ogg' : 'audio/webm'; }
+
+  function gui(mime, data) {
+    if (!window.opener) { datLai('⚠ Không thấy cửa sổ app NXT — mở lại từ nút 🎤 Lệnh.'); return; }
+    try { window.opener.postMessage({ type: 'NXT_VOICE_AUDIO', mime: mime, b64: data }, '*'); }
+    catch (e) { datLai('Không gửi được: ' + e.message); return; }
+    tt.textContent = '✅ Đã gửi — quay lại app để xem kết quả';
+    setTimeout(function () { window.close(); }, 700);
+  }
+  function xuLy(blob) {
+    if (!blob || blob.size < 1000) { datLai('Đoạn thu quá ngắn — bấm 🎙 nói lại.'); return; }
+    blob.arrayBuffer().then(function (buf) {
+      var AC = window.AudioContext || window.webkitAudioContext, ctx = AC ? new AC() : null;
+      if (!ctx) return gui(mimeGoc(blob.type), b64(new Uint8Array(buf)));
+      return giaiMa(ctx, buf.slice(0)).then(function (audio) {
+        try { ctx.close(); } catch (e) {}
+        gui('audio/wav', b64(thanhWav(audio)));
+      }, function () {
+        try { ctx.close(); } catch (e) {}
+        gui(mimeGoc(blob.type), b64(new Uint8Array(buf))); // không giải mã được → gửi nguyên định dạng gốc
+      });
+    }).catch(function (e) { datLai('Lỗi xử lý âm thanh: ' + (e && e.message)); });
   }
   mic.onclick = batDau;
-  window.focus();
 })();
 </script>
 </body>
